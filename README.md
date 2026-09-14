@@ -99,19 +99,19 @@ Monolog, Laravel, Rails and Python's `logging` all write a human prefix
 followed by a JSON context blob:
 
 ```
-[2026-05-20 12:04:53] dev.INFO: Receiving Mpesa callback from IP: ::1 {"transID":"ABC-007","transAmount":"1000","firstName":"John"}
+[2026-05-20 12:04:53] app.INFO: Received payment callback from IP: ::1 {"txnId":"TXN-007","amount":"1000","status":"confirmed"}
 ```
 
 Those lines are text *and* structured at once. `--field` reads into the
 payload, and `--extract` prints the payload alone:
 
 ```sh
-log-sift laravel.log --field transID=ABC-007        # finds it
-log-sift laravel.log --field MSISDN='*' --extract   # just the JSON
+log-sift app.log --field txnId=TXN-007        # finds it
+log-sift app.log --field txnId='*' --extract  # just the JSON
 ```
 
 ```json
-{"transID":"ABC-007","transAmount":"1000","firstName":"John"}
+{"txnId":"TXN-007","amount":"1000","status":"confirmed"}
 ```
 
 which pipes straight into `jq`, `python -m json.tool`, or a database loader.

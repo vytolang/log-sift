@@ -164,19 +164,19 @@ eq "uuid collapses as one token" "1" \
 # than "unsupported". That silent wrong answer is what these pin.
 
 cat > "$TMP/monolog.log" <<'MEOF'
-[2026-05-20 12:04:53] dev.INFO: callback from ::1 {"transID":"ABC-007","amount":"1000","name":"John"}
+[2026-05-20 12:04:53] dev.INFO: callback from ::1 {"txnId":"TXN-007","amount":"1000","name":"John"}
 [2026-05-20 12:04:57] dev.INFO: posting transaction {"id":16}
 [2026-05-20 12:04:58] dev.WARNING: App\Payment::post: failed, no invoice
-[2026-05-20 12:08:40] dev.INFO: callback from ::1 {"transID":"ABC-008","amount":"250","name":"Alice"}
+[2026-05-20 12:08:40] dev.INFO: callback from ::1 {"txnId":"TXN-008","amount":"250","name":"Alice"}
 MEOF
 
 eq "field query reaches an embedded payload" "1" \
-    "$BIN" "$TMP/monolog.log" --field transID=ABC-007 --count
+    "$BIN" "$TMP/monolog.log" --field txnId=TXN-007 --count
 eq "field wildcard selects payload-bearing lines" "2" \
-    "$BIN" "$TMP/monolog.log" --field transID='*' --count
+    "$BIN" "$TMP/monolog.log" --field txnId='*' --count
 eq "--extract prints only the payload" \
-    '{"transID":"ABC-007","amount":"1000","name":"John"}' \
-    sh -c "'$BIN' '$TMP/monolog.log' --field transID=ABC-007 --extract 2>/dev/null"
+    '{"txnId":"TXN-007","amount":"1000","name":"John"}' \
+    sh -c "'$BIN' '$TMP/monolog.log' --field txnId=TXN-007 --extract 2>/dev/null"
 
 # --extract must emit ONLY JSON: a prose line in the middle breaks whatever
 # consumes the stream, so payload-less lines are skipped, not printed raw.

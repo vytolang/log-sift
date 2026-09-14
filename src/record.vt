@@ -73,12 +73,12 @@ export class Record {
     // Laravel, Rails and Python-logging line is a human prefix followed by a
     // JSON context blob.
     //
-    //   [2026-05-20 12:04:53] dev.INFO: callback from ::1 {"transID":"X",...}
-    //   ^--------------- text ---------------------------^^--- payload ---^
+    //   [2026-05-20 12:04:53] app.INFO: callback from ::1 {"txnId":"X",...}
+    //   ^--------------- text --------------------------^^--- payload --^
     //
     // Treating format as one per-file choice makes those lines pure text, so
     // a --field query silently answers zero — which reads as "no such
-    // transaction" rather than "this tool cannot see in there". Recording the
+    // record" rather than "this tool cannot see in there". Recording the
     // offset is what lets a field query and --extract reach the payload
     // without reclassifying the line.
     payload: int;
