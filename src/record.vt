@@ -1,0 +1,328 @@
+// One log line, normalised.
+//
+// Every input format collapses to this shape, and everything downstream —
+// filtering, dedupe, merge, output — sees only this. That is what lets one
+// query interface work over JSON lines, logfmt and plain text without each
+// feature knowing which it came from.
+//
+// Fields are parsed LAZILY. A --level filter needs the level and nothing
+// else, and splitting out a dozen key=value pairs per line to answer it would
+// be most of the runtime on a file that is mostly rejected. `fields()` is
+// called only when a --field query exists.
+
+import { timeOf, NO_TIME } from "log-sift/src/tstamp";
+
+// Severity, ordered so a threshold comparison works. UNKNOWN sorts below
+// everything: a line with no recognisable level is never excluded by a
+// --level floor, because excluding it would silently drop stack traces and
+// continuation lines that belong to an error above them.
+export const LV_UNKNOWN: int = 0;
+export const LV_TRACE:   int = 1;
+export const LV_DEBUG:   int = 2;
+export const LV_INFO:    int = 3;
+export const LV_WARN:    int = 4;
+export const LV_ERROR:   int = 5;
+export const LV_FATAL:   int = 6;
+
+export fn levelName(l: int): string {
+    if (l == LV_TRACE) { return "TRACE"; }
+    if (l == LV_DEBUG) { return "DEBUG"; }
+    if (l == LV_INFO)  { return "INFO"; }
+    if (l == LV_WARN)  { return "WARN"; }
+    if (l == LV_ERROR) { return "ERROR"; }
+    if (l == LV_FATAL) { return "FATAL"; }
+    return "-";
+}
+
+// Parse a level name. Accepts the spellings that actually appear in logs:
+// "WARN" and "WARNING", "ERR" and "ERROR", "CRIT"/"FATAL"/"PANIC" together,
+// since no log distinguishes them in a way a filter should care about.
+export fn levelFrom(s: string): int {
+    let u = s.to_upper();
+    if (u == "TRACE" || u == "TRC")                     { return LV_TRACE; }
+    if (u == "DEBUG" || u == "DBG" || u == "D")         { return LV_DEBUG; }
+    if (u == "INFO" || u == "INF" || u == "I" || u == "NOTICE") { return LV_INFO; }
+    if (u == "WARN" || u == "WARNING" || u == "WRN" || u == "W") { return LV_WARN; }
+    if (u == "ERROR" || u == "ERR" || u == "E")         { return LV_ERROR; }
+    if (u == "FATAL" || u == "CRIT" || u == "CRITICAL" ||
+        u == "PANIC" || u == "EMERG" || u == "ALERT")   { return LV_FATAL; }
+    return LV_UNKNOWN;
+}
+
+export const F_TEXT:   int = 0;
+export const F_JSON:   int = 1;
+export const F_LOGFMT: int = 2;
+
+export fn sourceName(f: int): string {
+    if (f == F_JSON)   { return "json"; }
+    if (f == F_LOGFMT) { return "logfmt"; }
+    return "text";
+}
+
+export class Record {
+    raw: string;          // the line exactly as it arrived; what gets printed
+    ts: i64;              // unix seconds, or NO_TIME
+    level: int;
+    source: int;          // which format it was read as
+    origin: string;       // filename, for --merge's prefix
+    lineNo: int;
+
+    fn init() {
+        this.raw = "";
+        this.ts = NO_TIME;
+        this.level = LV_UNKNOWN;
+        this.source = F_TEXT;
+        this.origin = "";
+        this.lineNo = 0;
+    }
+
+    fn hasTime(): bool { return this.ts != NO_TIME; }
+}
+
+// ---- format sniffing ----------------------------------------------------
+
+// Decide a line's format from its shape. Cheap structural tests only — no
+// regex, no full parse — because this runs per line and the answer is almost
+// always the same as the previous line's.
+export fn sniffLine(line: string): int {
+    let i = 0;
+    while (i < line.len && line[i] == 32) { i += 1; }
+    if (i >= line.len) { return F_TEXT; }
+
+    // A JSON object line starts with '{' and ends with '}'. Not validated
+    // here: a truncated JSON line should still be carried as text rather than
+    // dropped, and the field parser will simply find nothing.
+    if (line[i] == 123) {
+        let j = line.len - 1;
+        while (j > i && line[j] == 32) { j -= 1; }
+        if (line[j] == 125) { return F_JSON; }
+    }
+
+    // logfmt is a run of bare key=value pairs. The test is deliberately
+    // strict — an '=' anywhere is far too loose, since plain prose contains
+    // them — so it requires the FIRST token to be exactly `key=`.
+    let k = i;
+    while (k < line.len && isKeyChar(line[k])) { k += 1; }
+    if (k > i && k < line.len && line[k] == 61) { return F_LOGFMT; }
+
+    return F_TEXT;
+}
+
+fn isKeyChar(c: int): bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+           (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 45;
+}
+
+// Sniff a whole sample and take the majority. One stray line must not
+// re-classify a file — a JSON log often carries a plain-text banner at the
+// top, and a text log occasionally contains one JSON-looking line.
+export fn sniff(lines: string[], sample: int): int {
+    let nJson = 0;
+    let nLogfmt = 0;
+    let seen = 0;
+    let i = 0;
+    while (i < lines.len && seen < sample) {
+        let ln = lines[i];
+        i += 1;
+        if (ln.trim().is_empty()) { continue; }
+        seen += 1;
+        let f = sniffLine(ln);
+        if (f == F_JSON)        { nJson += 1; }
+        else if (f == F_LOGFMT) { nLogfmt += 1; }
+    }
+    if (seen == 0) { return F_TEXT; }
+    if (nJson * 2 > seen)   { return F_JSON; }
+    if (nLogfmt * 2 > seen) { return F_LOGFMT; }
+    return F_TEXT;
+}
+
+// ---- field extraction ---------------------------------------------------
+
+// Find the value of `key` in this line, or "" if absent.
+//
+// Done as a scan per query rather than by building a map per line: a --field
+// query names one or two keys, and materialising every pair of every line to
+// answer it is the difference between reading a 500 MB log once and
+// allocating tens of millions of strings.
+export fn fieldOf(rec: Record, key: string): string {
+    if (rec.source == F_JSON)   { return jsonField(rec.raw, key); }
+    if (rec.source == F_LOGFMT) { return logfmtField(rec.raw, key); }
+    return "";
+}
+
+// "key": value — a scan for the quoted key at object depth, then the value.
+//
+// Not a full JSON parse: this is looking for one key, and parsing the whole
+// object per line to find it costs a document's worth of allocation for a
+// single string. Nested objects are skipped rather than descended into, so
+// `user.id` is not addressable — that is a documented limit, not an oversight.
+fn jsonField(s: string, key: string): string {
+    // Walked byte by byte rather than with repeated index_of: a miss has to
+    // resume after the previous hit, and re-searching a slice of the line per
+    // attempt allocates a string each time. This allocates nothing until a
+    // value is actually found.
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] != 34) { i += 1; continue; }        // find a '"'
+        // Does the key sit here, closed by a quote?
+        let end = i + 1 + key.len;
+        if (end + 1 > s.len || s[end] != 34) { i += 1; continue; }
+        if (s.slice(i + 1, end) != key) { i += 1; continue; }
+
+        // Only a KEY is followed by a colon; a string value equal to the key
+        // text is not, and skipping that check makes `{"x":"level"}` answer a
+        // query for `level`.
+        let p = end + 1;
+        while (p < s.len && s[p] == 32) { p += 1; }
+        if (p < s.len && s[p] == 58) {
+            p += 1;
+            while (p < s.len && s[p] == 32) { p += 1; }
+            return jsonValueAt(s, p);
+        }
+        i = end + 1;
+    }
+    return "";
+}
+
+fn jsonValueAt(s: string, p: int): string {
+    if (p >= s.len) { return ""; }
+    let c = s[p];
+    if (c == 34) {                       // string
+        let out = "";
+        let i = p + 1;
+        let run = i;
+        while (i < s.len) {
+            let ch = s[i];
+            if (ch == 92 && i + 1 < s.len) {       // backslash escape
+                if (i > run) { out += s.slice(run, i); }
+                let e = s[i + 1];
+                if (e == 110)      { out += "\n"; }
+                else if (e == 116) { out += "\t"; }
+                else if (e == 114) { out += "\r"; }
+                else               { out += s.slice(i + 1, i + 2); }
+                i += 2;
+                run = i;
+                continue;
+            }
+            if (ch == 34) { break; }
+            i += 1;
+        }
+        if (i > run) { out += s.slice(run, i); }
+        return out;
+    }
+    // number, bool, null, or an object/array we decline to descend into
+    let i = p;
+    while (i < s.len) {
+        let ch = s[i];
+        if (ch == 44 || ch == 125 || ch == 32) { break; }
+        i += 1;
+    }
+    return s.slice(p, i);
+}
+
+// key=value, key="quoted value".
+fn logfmtField(s: string, key: string): string {
+    let i = 0;
+    while (i < s.len) {
+        while (i < s.len && s[i] == 32) { i += 1; }
+        if (i >= s.len) { break; }
+        let ks = i;
+        while (i < s.len && isKeyChar(s[i])) { i += 1; }
+        if (i >= s.len || s[i] != 61) {
+            // Not a pair; skip to the next space.
+            while (i < s.len && s[i] != 32) { i += 1; }
+            continue;
+        }
+        let thisKey = s.slice(ks, i);
+        i += 1;                                   // past '='
+        let vs = i;
+        let val = "";
+        if (i < s.len && s[i] == 34) {
+            i += 1;
+            vs = i;
+            while (i < s.len && s[i] != 34) {
+                if (s[i] == 92) { i += 1; }
+                i += 1;
+            }
+            val = s.slice(vs, i);
+            if (i < s.len) { i += 1; }
+        } else {
+            while (i < s.len && s[i] != 32) { i += 1; }
+            val = s.slice(vs, i);
+        }
+        if (thisKey == key) { return val; }
+    }
+    return "";
+}
+
+// ---- level detection ----------------------------------------------------
+
+// The level of a line, by the cheapest route its format allows.
+fn detectLevel(raw: string, source: int): int {
+    if (source == F_JSON) {
+        let v = jsonField(raw, "level");
+        if (v.is_empty()) { v = jsonField(raw, "severity"); }
+        if (v.is_empty()) { v = jsonField(raw, "lvl"); }
+        if (!v.is_empty()) { return levelFrom(v); }
+    } else if (source == F_LOGFMT) {
+        let v = logfmtField(raw, "level");
+        if (v.is_empty()) { v = logfmtField(raw, "lvl"); }
+        if (!v.is_empty()) { return levelFrom(v); }
+    }
+
+    // Plain text: look for a bare level word in the first part of the line.
+    //
+    // Bounded to the first 120 bytes rather than scanning the whole line,
+    // because a level appears in a line's PREFIX. Searching the message body
+    // matches the word "error" inside prose and mislabels ordinary lines.
+    let limit = 120;
+    if (raw.len < limit) { limit = raw.len; }
+    let head = raw.slice(0, limit).to_upper();
+    if (head.index_of("FATAL") >= 0 || head.index_of("PANIC") >= 0 ||
+        head.index_of("CRIT") >= 0)  { return LV_FATAL; }
+    if (head.index_of("ERROR") >= 0 || head.index_of("ERR ") >= 0)  { return LV_ERROR; }
+    if (head.index_of("WARN") >= 0)  { return LV_WARN; }
+    if (head.index_of("INFO") >= 0)  { return LV_INFO; }
+    if (head.index_of("DEBUG") >= 0) { return LV_DEBUG; }
+    if (head.index_of("TRACE") >= 0) { return LV_TRACE; }
+    return LV_UNKNOWN;
+}
+
+// ---- building a record --------------------------------------------------
+
+// `source` is the file's sniffed format; a line that disagrees with it is
+// still read as the file's format, because a single odd line in a JSON log is
+// far more likely to be a truncated write than a genuine format change.
+export fn makeRecord(raw: string, source: int, origin: string, lineNo: int,
+                     utcDefault: bool, ref: i64): Record {
+    let r = new Record();
+    r.raw = raw;
+    r.source = source;
+    r.origin = origin;
+    r.lineNo = lineNo;
+    r.level = detectLevel(raw, source);
+
+    if (source == F_JSON) {
+        // A JSON log's time is a field, not a prefix, so the positional
+        // scanner would not find it.
+        let t = jsonField(raw, "timestamp");
+        if (t.is_empty()) { t = jsonField(raw, "time"); }
+        if (t.is_empty()) { t = jsonField(raw, "ts"); }
+        if (t.is_empty()) { t = jsonField(raw, "@timestamp"); }
+        if (!t.is_empty()) {
+            r.ts = timeOf(t, utcDefault, ref);
+            if (r.ts == NO_TIME) { r.ts = timeOf(raw, utcDefault, ref); }
+            return r;
+        }
+    } else if (source == F_LOGFMT) {
+        let t = logfmtField(raw, "time");
+        if (t.is_empty()) { t = logfmtField(raw, "ts"); }
+        if (!t.is_empty()) {
+            r.ts = timeOf(t, utcDefault, ref);
+            if (r.ts != NO_TIME) { return r; }
+        }
+    }
+
+    r.ts = timeOf(raw, utcDefault, ref);
+    return r;
+}

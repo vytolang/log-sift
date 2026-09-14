@@ -1,0 +1,366 @@
+// log-sift — one query interface over whatever format the log is in.
+//
+//     log-sift app.log --level ERROR --since 1h
+//     log-sift app.log --field user_id=42
+//     log-sift *.log --merge
+//     log-sift app.log --dedupe
+//
+// The headline is --dedupe: real logs are the same few events repeated
+// thousands of times with a different id in each copy, and collapsing them by
+// shape turns four thousand lines into four.
+
+import { cli, Cli } from "vyto/cli";
+import { exit } from "vyto/os";
+import { unixSec } from "vyto/util/time";
+import { Record, makeRecord, sniff, levelFrom, levelName, sourceName,
+         LV_UNKNOWN, F_TEXT } from "log-sift/src/record";
+import { Source, open, lines, stdinIsTerminal, basename } from "log-sift/src/source";
+import { Query, query, matches, parseDuration } from "log-sift/src/filter";
+import { Deduper, deduper, Group, sortGroups, shapeOf,
+         DEFAULT_CAP } from "log-sift/src/dedupe";
+import { NO_TIME } from "log-sift/src/tstamp";
+import { date_from_unix_local, date_format } from "vyto/util/date";
+
+export const VERSION: string = "0.1.0";
+
+extern "C" { fn ls_flush(); }
+
+fn main() {
+    let app = new Cli("log-sift", "one query interface over any log format");
+    app.option("level", "minimum severity: trace|debug|info|warn|error|fatal")
+       .short("l").meta("LEVEL");
+    app.option("level-only", "exactly this severity, not a minimum").meta("LEVEL");
+    app.option("since", "only lines newer than this, e.g. 30m, 2h, 1d").meta("DUR");
+    app.option("until", "only lines older than this").meta("DUR");
+    app.option("field", "key=value; repeatable, value * means any")
+       .short("f").meta("K=V").many();
+    app.option("grep", "only lines containing this text").short("g").meta("TEXT");
+    app.option("exclude", "drop lines containing this text").short("v").meta("TEXT");
+    app.flag("ignore-case", "make --grep, --exclude and --field caseless").short("i");
+    app.flag("dedupe", "collapse repeated lines by shape").short("d");
+    app.intOption("shapes", "maximum distinct shapes to track when deduping")
+       .dfltInt(DEFAULT_CAP).meta("N");
+    app.flag("merge", "interleave several files by timestamp").short("m");
+    app.flag("count", "print only the number of matching lines").short("c");
+    app.flag("utc", "read zone-less timestamps as UTC, not local time");
+    app.flag("stats", "summarise what was read instead of printing lines");
+    app.intOption("head", "stop after N matching lines").dfltInt(0).meta("N");
+    app.flag("no-prefix", "with --merge, omit the filename prefix");
+    app.flag("version", "print the version and exit");
+    app.rest("files", "log files, or - for stdin").meta("FILE");
+
+    if (!app.parse(args())) {
+        print(app.report());
+        exit(app.exitCode());
+    }
+    if (app.helpWanted()) { print(app.usage()); return; }
+    if (app.on("version")) { print("log-sift " + VERSION); return; }
+
+    let paths = app.all("files");
+    if (paths.len == 0) {
+        // Reading a terminal would hang with no indication why, so that case
+        // gets the usage text instead.
+        if (stdinIsTerminal()) {
+            print(app.usage());
+            exit(2);
+        }
+        paths = ["-"];
+    }
+
+    let q = buildQuery(app);
+    if (q == null) { exit(2); }
+
+    let utc = app.on("utc");
+    let srcs: Source[] = [];
+    let bad = 0;
+    let i = 0;
+    while (i < paths.len) {
+        let s = open(paths[i]);
+        i += 1;
+        if (!s.ok) {
+            print(`log-sift: {s.path}: {s.err}`);
+            bad += 1;
+            continue;
+        }
+        srcs.push(s);
+    }
+    // 2, not 1: every file named was unreadable, which is an error, and a
+    // script must be able to tell that from "read fine, matched nothing".
+    if (srcs.len == 0) { exit(2); }
+
+    // Read everything into records. Merge needs them all in hand to sort;
+    // the non-merge path could stream, but keeping one code path is worth
+    // more than the memory on inputs this size.
+    let recs: Record[] = [];
+    let scanned = 0;
+    i = 0;
+    while (i < srcs.len) {
+        let s = srcs[i];
+        i += 1;
+        let ls = lines(s);
+        let fmt = sniff(ls, 50);
+        let n = 0;
+        while (n < ls.len) {
+            let raw = ls[n];
+            n += 1;
+            if (raw.is_empty()) { continue; }
+            scanned += 1;
+            let r = makeRecord(raw, fmt, s.label, n, utc, s.mtime);
+            if (!matches(q, r)) { continue; }
+            recs.push(r);
+        }
+    }
+
+    if (app.on("merge")) { sortByTime(recs); }
+
+    if (app.on("count")) {
+        print(`{recs.len}`);
+        exit(exitFor(recs.len, bad));
+    }
+
+    if (app.on("stats")) {
+        printStats(srcs, recs, scanned);
+        exit(exitFor(recs.len, bad));
+    }
+
+    if (app.on("dedupe")) {
+        printDeduped(recs, app.getInt("shapes"));
+        exit(exitFor(recs.len, bad));
+    }
+
+    let showPrefix = srcs.len > 1 && !app.on("no-prefix");
+    let limit = app.getInt("head");
+    let shown = 0;
+    i = 0;
+    while (i < recs.len) {
+        let r = recs[i];
+        i += 1;
+        if (showPrefix) { print(`{r.origin}: {r.raw}`); }
+        else            { print(r.raw); }
+        shown += 1;
+        if (limit > 0 && shown >= limit) { break; }
+    }
+    exit(exitFor(recs.len, bad));
+}
+
+// grep's convention, which every script already branches on: 0 found
+// something, 1 found nothing, 2 something went wrong.
+fn exitFor(found: int, bad: int): int {
+    if (bad > 0) { return 2; }
+    if (found == 0) { return 1; }
+    return 0;
+}
+
+fn buildQuery(app: Cli): Query? {
+    let q = query();
+    q.caseless = app.on("ignore-case");
+
+    let lv = app.get("level");
+    if (!lv.is_empty()) {
+        q.minLevel = levelFrom(lv);
+        if (q.minLevel == LV_UNKNOWN) {
+            print(`log-sift: --level: "{lv}" is not a severity`);
+            print("  one of: trace debug info warn error fatal");
+            return null;
+        }
+    }
+    let lvo = app.get("level-only");
+    if (!lvo.is_empty()) {
+        q.exactLevel = levelFrom(lvo);
+        if (q.exactLevel == LV_UNKNOWN) {
+            print(`log-sift: --level-only: "{lvo}" is not a severity`);
+            return null;
+        }
+    }
+
+    let now = unixSec();
+    let since = app.get("since");
+    if (!since.is_empty()) {
+        let d = parseDuration(since);
+        if (d < 0) {
+            print(`log-sift: --since: "{since}" is not a duration (try 30m, 2h, 1d)`);
+            return null;
+        }
+        q.since = now - d;
+    }
+    let until = app.get("until");
+    if (!until.is_empty()) {
+        let d = parseDuration(until);
+        if (d < 0) {
+            print(`log-sift: --until: "{until}" is not a duration (try 30m, 2h, 1d)`);
+            return null;
+        }
+        q.until = now - d;
+    }
+
+    let fields = app.all("field");
+    let i = 0;
+    while (i < fields.len) {
+        let f = fields[i];
+        i += 1;
+        let eq = f.index_of("=");
+        if (eq <= 0) {
+            print(`log-sift: --field: "{f}" is not key=value`);
+            return null;
+        }
+        q.keys.push(f.slice(0, eq));
+        q.vals.push(f.slice(eq + 1, f.len));
+    }
+
+    q.grep = app.get("grep");
+    q.grepV = app.get("exclude");
+    return q;
+}
+
+// ---- merge ordering -----------------------------------------------------
+
+// Sort by timestamp, keeping lines without one attached to the line above.
+//
+// A stack trace has no timestamp on its frames; sorting them to the front (as
+// a -1 key would) or dropping them both destroy the trace. So an untimed line
+// INHERITS the previous line's time, and a stable sort then keeps it in place
+// after its parent.
+fn sortByTime(recs: Record[]) {
+    let last = NO_TIME;
+    let i = 0;
+    let keys: i64[] = [];
+    while (i < recs.len) {
+        let r = recs[i];
+        i += 1;
+        if (r.hasTime()) { last = r.ts; }
+        keys.push(last);
+    }
+
+    // Insertion sort: stable, and the input is usually several already-sorted
+    // runs, which is its best case.
+    i = 1;
+    while (i < recs.len) {
+        let vr = recs[i];
+        let vk = keys[i];
+        let j = i - 1;
+        while (j >= 0 && greaterKey(keys[j], vk)) {
+            recs[j + 1] = recs[j];
+            keys[j + 1] = keys[j];
+            j -= 1;
+        }
+        recs[j + 1] = vr;
+        keys[j + 1] = vk;
+        i += 1;
+    }
+}
+
+// A NO_TIME key sorts last, not first: it means "no time was ever seen in
+// this file", and a file of untimed lines belongs after the timed ones rather
+// than before everything.
+fn greaterKey(a: i64, b: i64): bool {
+    if (a == NO_TIME) { return b != NO_TIME; }
+    if (b == NO_TIME) { return false; }
+    return a > b;
+}
+
+// ---- output -------------------------------------------------------------
+
+fn tsLabel(t: i64): string {
+    if (t == NO_TIME) { return "-"; }
+    return date_format(date_from_unix_local(t), "%H:%M:%S");
+}
+
+fn printDeduped(recs: Record[], cap: int) {
+    let d = deduper(cap);
+    let i = 0;
+    while (i < recs.len) {
+        d.add(recs[i]);
+        i += 1;
+    }
+    sortGroups(d.groups);
+
+    if (d.groups.len == 0) { return; }
+
+    // Width of the count column, so the samples line up.
+    let w = 1;
+    i = 0;
+    while (i < d.groups.len) {
+        let c = `{d.groups[i].count}`;
+        if (c.len > w) { w = c.len; }
+        i += 1;
+    }
+
+    i = 0;
+    while (i < d.groups.len) {
+        let g = d.groups[i];
+        i += 1;
+        let count = `{g.count}`.pad_start(w, " ");
+        if (g.count == 1) {
+            // A single occurrence gets no "x", but its number still sits in
+            // the same column as the repeats — the marker is what is dropped,
+            // not the alignment, or the list cannot be scanned down.
+            print(`   {count}  {g.sample}`);
+        } else {
+            // The window is what turns a count into a diagnosis: 4000 in two
+            // seconds is a storm, 4000 over a day is background noise.
+            let span = "";
+            if (g.firstTs != NO_TIME && g.lastTs != NO_TIME &&
+                g.lastTs > g.firstTs) {
+                span = `  [{tsLabel(g.firstTs)}-{tsLabel(g.lastTs)}]`;
+            }
+            print(`  x{count}  {g.sample}{span}`);
+        }
+    }
+
+    if (d.dropped > 0) {
+        print("");
+        print(`{d.dropped} lines not classified: hit the {cap}-shape limit`);
+        print("Raise it with --shapes N, or narrow the query first.");
+    }
+}
+
+fn printStats(srcs: Source[], recs: Record[], scanned: int) {
+    print(`files    {srcs.len}`);
+    print(`scanned  {scanned}`);
+    print(`matched  {recs.len}`);
+
+    if (recs.len == 0) { return; }
+
+    // Level histogram, over what matched.
+    let counts: int[] = [0, 0, 0, 0, 0, 0, 0];
+    let timed = 0;
+    let lo = NO_TIME;
+    let hi = NO_TIME;
+    let i = 0;
+    while (i < recs.len) {
+        let r = recs[i];
+        i += 1;
+        counts[r.level] += 1;
+        if (r.hasTime()) {
+            timed += 1;
+            if (lo == NO_TIME || r.ts < lo) { lo = r.ts; }
+            if (hi == NO_TIME || r.ts > hi) { hi = r.ts; }
+        }
+    }
+
+    print("");
+    let l = 6;
+    while (l >= 0) {
+        if (counts[l] > 0) {
+            print(`{levelName(l).pad_end(8, " ")} {counts[l]}`);
+        }
+        l -= 1;
+    }
+
+    if (timed > 0) {
+        print("");
+        print(`span     {tsLabel(lo)} - {tsLabel(hi)}`);
+        // Saying how many lines had no time is what stops a --since window
+        // from looking authoritative when most lines were never in scope.
+        if (timed < recs.len) {
+            print(`untimed  {recs.len - timed} of {recs.len}`);
+        }
+    }
+
+    // How much the log would compress, which is the argument for --dedupe.
+    let d = deduper(DEFAULT_CAP);
+    i = 0;
+    while (i < recs.len) { d.add(recs[i]); i += 1; }
+    print("");
+    print(`shapes   {d.groups.len} distinct (--dedupe to collapse)`);
+}

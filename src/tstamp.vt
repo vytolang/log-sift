@@ -1,0 +1,352 @@
+// Finding and parsing the timestamp in a log line.
+//
+// Every downstream feature depends on this: --since needs an instant,
+// --merge needs a sortable key, and --dedupe needs to report a first/last
+// window. So it runs on every line of every file and has to be cheap.
+//
+// The approach is deliberately NOT a regex per format. Trying each of a dozen
+// patterns against every line costs a dozen failed matches on the common case,
+// and pcre2 is not free. Instead a line is CLASSIFIED once by cheap structural
+// tests on its first bytes, and only the matching parser runs.
+//
+// Everything normalises to Unix seconds. A log with mixed formats and mixed
+// zones sorts correctly because nothing downstream ever sees the original
+// text.
+
+import { date_parse, date_to_unix, date_to_unix_local, date_is_valid,
+         DateTime } from "vyto/util/date";
+
+// No timestamp found. Not an error — plenty of log lines are continuations,
+// stack-trace frames, or bare text, and dropping them would be worse than
+// carrying them with an unknown time.
+export const NO_TIME: i64 = -1;
+
+// The formats worth recognising, in the order they are tested.
+export const T_NONE:    int = 0;
+export const T_ISO:     int = 1;   // 2026-09-14T10:23:01(.sss)?(Z|+01:00)?
+export const T_SPACE:   int = 2;   // 2026-09-14 10:23:01(.sss)?
+export const T_SYSLOG:  int = 3;   // Sep 14 10:23:01
+export const T_APACHE:  int = 4;   // 14/Sep/2026:10:23:01 +0000
+export const T_EPOCH:   int = 5;   // 1757844181(.123)?
+
+export fn formatName(f: int): string {
+    if (f == T_ISO)    { return "iso"; }
+    if (f == T_SPACE)  { return "datetime"; }
+    if (f == T_SYSLOG) { return "syslog"; }
+    if (f == T_APACHE) { return "apache"; }
+    if (f == T_EPOCH)  { return "epoch"; }
+    return "none";
+}
+
+fn isDigit(c: int): bool { return c >= 48 && c <= 57; }
+
+fn digitsAt(s: string, i: int, n: int): bool {
+    if (i + n > s.len) { return false; }
+    let k = 0;
+    while (k < n) {
+        if (!isDigit(s[i + k])) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+fn num(s: string, i: int, n: int): int {
+    let v = 0;
+    let k = 0;
+    while (k < n) { v = v * 10 + (s[i + k] - 48); k += 1; }
+    return v;
+}
+
+// ---- classification -----------------------------------------------------
+
+// Where in the line the timestamp starts, and which format it is.
+//
+// Returns the format; `at` receives the offset. Only the line's opening is
+// examined — a timestamp buried mid-line is not a timestamp, it is data, and
+// treating it as one makes --since silently wrong on lines that merely
+// mention a date.
+export fn classify(line: string, at: int[]): int {
+    let i = 0;
+    // Leading punctuation is common: "[2026-09-14...", "<133>Sep 14...".
+    // Skip a small fixed budget of it rather than scanning the whole line.
+    let budget = 0;
+    while (i < line.len && budget < 8) {
+        let c = line[i];
+        if (c == 91 || c == 60 || c == 32 || c == 34) { i += 1; budget += 1; }
+        else { break; }
+    }
+    at[0] = i;
+
+    // "2026-09-14" — the only format starting with 4 digits then '-'.
+    if (digitsAt(line, i, 4) && i + 10 <= line.len && line[i + 4] == 45) {
+        if (i + 10 < line.len && (line[i + 10] == 84 || line[i + 10] == 32)) {
+            if (line[i + 10] == 84) { return T_ISO; }
+            return T_SPACE;
+        }
+        return T_ISO;
+    }
+
+    // "14/Sep/2026:10:23:01" — Apache/nginx common log.
+    if (digitsAt(line, i, 2) && i + 2 < line.len && line[i + 2] == 47) {
+        return T_APACHE;
+    }
+
+    // "Sep 14 10:23:01" — syslog. Three letters, space, then a day that may
+    // be space-padded ("Sep  4").
+    if (i + 6 <= line.len && isAlpha(line[i]) && isAlpha(line[i + 1]) &&
+        isAlpha(line[i + 2]) && line[i + 3] == 32) {
+        return T_SYSLOG;
+    }
+
+    // A bare epoch: 10 digits (seconds) and not part of a longer number.
+    // Tested last because it is the most likely to fire on something that is
+    // not a timestamp at all.
+    if (digitsAt(line, i, 10)) {
+        let after = i + 10;
+        if (after >= line.len || !isDigit(line[after])) { return T_EPOCH; }
+    }
+
+    at[0] = 0;
+    return T_NONE;
+}
+
+fn isAlpha(c: int): bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// ---- month names --------------------------------------------------------
+
+// "Sep" -> 9, or 0. A table rather than strptime's %b because %b is
+// locale-dependent, and a log written in one locale being read in another is
+// exactly the case where silent misparsing would be worst.
+fn monthOf(s: string, i: int): int {
+    if (i + 3 > s.len) { return 0; }
+    let m = s.slice(i, i + 3);
+    if (m == "Jan") { return 1; }
+    if (m == "Feb") { return 2; }
+    if (m == "Mar") { return 3; }
+    if (m == "Apr") { return 4; }
+    if (m == "May") { return 5; }
+    if (m == "Jun") { return 6; }
+    if (m == "Jul") { return 7; }
+    if (m == "Aug") { return 8; }
+    if (m == "Sep") { return 9; }
+    if (m == "Oct") { return 10; }
+    if (m == "Nov") { return 11; }
+    if (m == "Dec") { return 12; }
+    return 0;
+}
+
+// ---- civil time -> unix seconds -----------------------------------------
+
+// Days from 1970-01-01 to y-m-d, by Howard Hinnant's days_from_civil.
+//
+// Written out rather than going through date_to_unix for every line: that
+// builds a struct and crosses into C per call, and this runs on every line
+// of every file. Pure integer arithmetic, no allocation, no FFI.
+fn daysFromCivil(y: int, m: int, d: int): i64 {
+    let yy = y;
+    if (m <= 2) { yy -= 1; }
+    let era = yy / 400;
+    if (yy < 0) { era = (yy - 399) / 400; }
+    let yoe = yy - era * 400;                       // [0, 399]
+    let mp = (m + 9) % 12;                          // Mar=0
+    let doy = (153 * mp + 2) / 5 + d - 1;           // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (era as i64) * 146097 + (doe as i64) - 719468;
+}
+
+fn civilToUnix(y: int, mo: int, d: int, h: int, mi: int, s: int): i64 {
+    return daysFromCivil(y, mo, d) * 86400 + (h as i64) * 3600 +
+           (mi as i64) * 60 + (s as i64);
+}
+
+// ---- the parsers --------------------------------------------------------
+
+// Parse the timestamp `fmt` says is at `at`, as Unix seconds.
+//
+// `utcDefault` decides what a timestamp with NO zone means. Logs are usually
+// written in the machine's local time, so local is the sensible default, but
+// --utc exists because a shipped log read on another machine is not.
+//
+// Returns NO_TIME if the text does not actually parse — classification is a
+// guess from the first bytes and this is where it is confirmed.
+export fn parseAt(line: string, fmt: int, at: int, utcDefault: bool,
+                  ref: i64): i64 {
+    if (fmt == T_ISO || fmt == T_SPACE) { return parseIso(line, at, utcDefault); }
+    if (fmt == T_SYSLOG)                { return parseSyslog(line, at, utcDefault, ref); }
+    if (fmt == T_APACHE)                { return parseApache(line, at); }
+    if (fmt == T_EPOCH)                 { return parseEpoch(line, at); }
+    return NO_TIME;
+}
+
+// 2026-09-14T10:23:01 / 2026-09-14 10:23:01, with optional .fff and zone.
+fn parseIso(s: string, at: int, utcDefault: bool): i64 {
+    if (!digitsAt(s, at, 4) || at + 19 > s.len) { return NO_TIME; }
+    let y = num(s, at, 4);
+    if (s[at + 4] != 45 || !digitsAt(s, at + 5, 2)) { return NO_TIME; }
+    let mo = num(s, at + 5, 2);
+    if (s[at + 7] != 45 || !digitsAt(s, at + 8, 2)) { return NO_TIME; }
+    let d = num(s, at + 8, 2);
+    let sep = s[at + 10];
+    if (sep != 84 && sep != 32) { return NO_TIME; }
+    if (!digitsAt(s, at + 11, 2) || s[at + 13] != 58) { return NO_TIME; }
+    let h = num(s, at + 11, 2);
+    if (!digitsAt(s, at + 14, 2) || s[at + 16] != 58) { return NO_TIME; }
+    let mi = num(s, at + 14, 2);
+    if (!digitsAt(s, at + 17, 2)) { return NO_TIME; }
+    let sec = num(s, at + 17, 2);
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) {
+        return NO_TIME;
+    }
+
+    let base = civilToUnix(y, mo, d, h, mi, sec);
+
+    // Skip fractional seconds, then look for a zone.
+    let p = at + 19;
+    if (p < s.len && s[p] == 46) {
+        p += 1;
+        while (p < s.len && isDigit(s[p])) { p += 1; }
+    }
+    return applyZone(s, p, base, utcDefault);
+}
+
+// A trailing "Z", "+01:00", "+0100" or "-05:00" turns the civil time into an
+// absolute one. Absent, `utcDefault` decides.
+fn applyZone(s: string, p: int, base: i64, utcDefault: bool): i64 {
+    if (p < s.len && (s[p] == 90 || s[p] == 122)) { return base; }   // Z/z
+    if (p + 3 <= s.len && (s[p] == 43 || s[p] == 45)) {
+        let neg = s[p] == 45;
+        if (!digitsAt(s, p + 1, 2)) { return localise(base, utcDefault); }
+        let oh = num(s, p + 1, 2);
+        let om = 0;
+        let q = p + 3;
+        if (q < s.len && s[q] == 58) { q += 1; }
+        if (digitsAt(s, q, 2)) { om = num(s, q, 2); }
+        let off = (oh as i64) * 3600 + (om as i64) * 60;
+        if (neg) { return base + off; }
+        return base - off;
+    }
+    return localise(base, utcDefault);
+}
+
+// A zone-less timestamp read as local time.
+//
+// Done by round-tripping through the date module rather than by guessing an
+// offset: the offset is not a constant, it changes across a DST boundary, and
+// a log that spans one would otherwise shift by an hour mid-file.
+fn localise(base: i64, utcDefault: bool): i64 {
+    if (utcDefault) { return base; }
+    let dt = unixToCivil(base);
+    return date_to_unix_local(dt);
+}
+
+// Inverse of civilToUnix, for handing a DateTime to the date module.
+fn unixToCivil(t: i64): DateTime {
+    let days = t / 86400;
+    let rem = t % 86400;
+    if (rem < 0) { rem += 86400; days -= 1; }
+    let z = days + 719468;
+    let era = z / 146097;
+    if (z < 0) { era = (z - 146096) / 146097; }
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let yy = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + 3;
+    if (mp >= 10) { m = mp - 9; }
+    if (m <= 2) { yy += 1; }
+    return DateTime(yy as int, m as int, d as int,
+                    (rem / 3600) as int, ((rem % 3600) / 60) as int,
+                    (rem % 60) as int, 0, 0);
+}
+
+// "Sep 14 10:23:01" — no year, which is syslog's enduring design mistake.
+//
+// The year is inferred from `ref`, the instant the file was last written:
+// the year that places the timestamp at or before it, so a December line read
+// in January is dated to the old year rather than eleven months ahead.
+//
+// `ref` is threaded through every call rather than held as module state,
+// because Vyto has no module-level mutable binding and because a hidden
+// global would be wrong anyway: --merge reads several files at once, each
+// with its own mtime.
+fn parseSyslog(s: string, at: int, utcDefault: bool, ref: i64): i64 {
+    let mo = monthOf(s, at);
+    if (mo == 0) { return NO_TIME; }
+    let p = at + 4;
+    // The day may be space-padded: "Sep  4 10:23:01".
+    while (p < s.len && s[p] == 32) { p += 1; }
+    if (!digitsAt(s, p, 1)) { return NO_TIME; }
+    let dLen = 1;
+    if (digitsAt(s, p, 2)) { dLen = 2; }
+    let d = num(s, p, dLen);
+    p += dLen;
+    if (p >= s.len || s[p] != 32) { return NO_TIME; }
+    p += 1;
+    if (!digitsAt(s, p, 2) || p + 8 > s.len || s[p + 2] != 58) { return NO_TIME; }
+    let h = num(s, p, 2);
+    if (!digitsAt(s, p + 3, 2) || s[p + 5] != 58) { return NO_TIME; }
+    let mi = num(s, p + 3, 2);
+    if (!digitsAt(s, p + 6, 2)) { return NO_TIME; }
+    let sec = num(s, p + 6, 2);
+    if (d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) { return NO_TIME; }
+
+    // The reference is the file's own mtime, so a rotated log keeps its real
+    // year instead of being stamped with today's.
+    let refDt = unixToCivil(ref);
+    let y = refDt.year;
+    let t = civilToUnix(y, mo, d, h, mi, sec);
+    // More than a day ahead of the reference means the log wrapped a new year.
+    if (t > ref + 86400) { t = civilToUnix(y - 1, mo, d, h, mi, sec); }
+    return localise(t, utcDefault);
+}
+
+// 14/Sep/2026:10:23:01 +0000
+fn parseApache(s: string, at: int): i64 {
+    if (!digitsAt(s, at, 2) || at + 20 > s.len) { return NO_TIME; }
+    let d = num(s, at, 2);
+    if (s[at + 2] != 47) { return NO_TIME; }
+    let mo = monthOf(s, at + 3);
+    if (mo == 0 || s[at + 6] != 47) { return NO_TIME; }
+    if (!digitsAt(s, at + 7, 4)) { return NO_TIME; }
+    let y = num(s, at + 7, 4);
+    if (s[at + 11] != 58) { return NO_TIME; }
+    if (!digitsAt(s, at + 12, 2) || s[at + 14] != 58) { return NO_TIME; }
+    let h = num(s, at + 12, 2);
+    if (!digitsAt(s, at + 15, 2) || s[at + 17] != 58) { return NO_TIME; }
+    let mi = num(s, at + 15, 2);
+    if (!digitsAt(s, at + 18, 2)) { return NO_TIME; }
+    let sec = num(s, at + 18, 2);
+    if (d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) { return NO_TIME; }
+
+    let base = civilToUnix(y, mo, d, h, mi, sec);
+    // Apache always writes a zone, after a space.
+    let p = at + 20;
+    if (p < s.len && s[p] == 32) { p += 1; }
+    return applyZone(s, p, base, true);
+}
+
+fn parseEpoch(s: string, at: int): i64 {
+    if (!digitsAt(s, at, 10)) { return NO_TIME; }
+    let v = 0 as i64;
+    let k = 0;
+    while (k < 10) { v = v * 10 + ((s[at + k] - 48) as i64); k += 1; }
+    return v;
+}
+
+// ---- the one call the rest of the program makes -------------------------
+
+// The instant this line refers to, or NO_TIME.
+//
+// `ref` only matters for syslog, whose format omits the year; pass the
+// source file's mtime, or the current time for a stream.
+export fn timeOf(line: string, utcDefault: bool, ref: i64): i64 {
+    if (line.is_empty()) { return NO_TIME; }
+    let at: int[] = [0];
+    let fmt = classify(line, at);
+    if (fmt == T_NONE) { return NO_TIME; }
+    return parseAt(line, fmt, at[0], utcDefault, ref);
+}

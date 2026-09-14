@@ -1,0 +1,353 @@
+// Collapsing repeated lines by SHAPE.
+//
+// This is the feature the tool exists for. Real logs are the same handful of
+// events repeated thousands of times with a different id, duration or address
+// in each copy, so an exact-match collapse finds almost nothing. What a
+// person wants to know is "which KINDS of thing happened, and how often".
+//
+// The shape of a line is the line with every varying token replaced by a
+// placeholder:
+//
+//     "GET /users/8821 200 in 43ms"   ->  "GET /users/<N> <N> in <N>ms"
+//     "GET /users/9134 200 in 51ms"   ->  same
+//
+// Both collapse to one row with a count of 2. The FIRST line seen is what
+// gets printed, so the output is a real line from the log rather than a
+// synthesised pattern with placeholders in it — you can copy it and search
+// for it.
+//
+// Memory is bounded. An unbounded shape table on a --follow stream is a leak,
+// and a log with a genuinely unbounded variety of lines (one carrying a raw
+// payload per line, say) would grow it without limit even on a finite file.
+// So the table has a cap, and hitting it is REPORTED rather than silently
+// changing the answer.
+
+import { Record } from "log-sift/src/record";
+
+export const DEFAULT_CAP: int = 10000;
+
+export class Group {
+    shape: string;
+    sample: string;       // the first line that had this shape
+    origin: string;
+    count: int;
+    firstTs: i64;
+    lastTs: i64;
+    firstLine: int;
+
+    fn init() {
+        this.shape = "";
+        this.sample = "";
+        this.origin = "";
+        this.count = 0;
+        this.firstTs = -1;
+        this.lastTs = -1;
+        this.firstLine = 0;
+    }
+}
+
+// ---- shape ---------------------------------------------------------------
+
+fn isDigit(c: int): bool { return c >= 48 && c <= 57; }
+fn isHex(c: int): bool {
+    return isDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+// The shape of a line: varying tokens replaced by placeholders.
+//
+// Order matters. A UUID is hex-with-dashes, so it has to be recognised before
+// the number rule splits it at each '-'; an ISO timestamp is digits and
+// dashes for the same reason. Each rule below is tried at the start of a
+// token, longest-pattern first.
+export fn shapeOf(line: string): string {
+    let out = "";
+    let run = 0;                 // start of the literal stretch not yet copied
+    let i = 0;
+
+    while (i < line.len) {
+        let c = line[i];
+
+        // Only start a candidate at a token boundary. Without this, the "42"
+        // inside "route42" becomes a placeholder and two genuinely different
+        // routes collapse together.
+        let atStart = i == 0 || isBoundary(line[i - 1]);
+        if (!atStart || !couldStart(c)) { i += 1; continue; }
+
+        let n = matchToken(line, i);
+        if (n <= 0) { i += 1; continue; }
+
+        if (i > run) { out += line.slice(run, i); }
+        out += placeholderFor(line, i, n);
+        i += n;
+        run = i;
+    }
+    if (line.len > run) { out += line.slice(run, line.len); }
+    return out;
+}
+
+fn isBoundary(c: int): bool {
+    return c == 32 || c == 9 || c == 61 || c == 40 || c == 91 || c == 123 ||
+           c == 34 || c == 39 || c == 44 || c == 58 || c == 47 || c == 60;
+}
+
+fn couldStart(c: int): bool { return isHex(c) || c == 48; }
+
+// How long the variable token at `i` is, or 0.
+fn matchToken(s: string, i: int): int {
+    let n = 0;
+
+    n = matchUuid(s, i);      if (n > 0) { return n; }
+    n = matchIsoTime(s, i);   if (n > 0) { return n; }
+    n = matchIpv4(s, i);      if (n > 0) { return n; }
+    n = matchHexBlob(s, i);   if (n > 0) { return n; }
+    n = matchNumber(s, i);    if (n > 0) { return n; }
+    return 0;
+}
+
+fn placeholderFor(s: string, i: int, n: int): string {
+    let t = s.slice(i, i + n);
+    if (matchUuid(s, i) == n)    { return "<UUID>"; }
+    if (matchIsoTime(s, i) == n) { return "<TIME>"; }
+    if (matchIpv4(s, i) == n)    { return "<IP>"; }
+    if (matchUuid(s, i) == 0 && matchIpv4(s, i) == 0 &&
+        matchHexBlob(s, i) == n) { return "<HEX>"; }
+    return "<N>";
+}
+
+// 8-4-4-4-12 hex.
+fn matchUuid(s: string, i: int): int {
+    if (i + 36 > s.len) { return 0; }
+    let groups: int[] = [8, 4, 4, 4, 12];
+    let p = i;
+    let g = 0;
+    while (g < 5) {
+        let need = groups[g];
+        let k = 0;
+        while (k < need) {
+            if (p + k >= s.len || !isHex(s[p + k])) { return 0; }
+            k += 1;
+        }
+        p += need;
+        if (g < 4) {
+            if (p >= s.len || s[p] != 45) { return 0; }
+            p += 1;
+        }
+        g += 1;
+    }
+    return p - i;
+}
+
+// 2026-09-14T10:23:01 and friends, including a trailing fraction and zone.
+// Recognised so a timestamp inside a message body does not shatter into
+// several <N> placeholders.
+fn matchIsoTime(s: string, i: int): int {
+    if (i + 19 > s.len) { return 0; }
+    if (!digits(s, i, 4) || s[i + 4] != 45) { return 0; }
+    if (!digits(s, i + 5, 2) || s[i + 7] != 45) { return 0; }
+    if (!digits(s, i + 8, 2)) { return 0; }
+    let sep = s[i + 10];
+    if (sep != 84 && sep != 32) { return 0; }
+    if (!digits(s, i + 11, 2) || s[i + 13] != 58) { return 0; }
+    if (!digits(s, i + 14, 2) || s[i + 16] != 58) { return 0; }
+    if (!digits(s, i + 17, 2)) { return 0; }
+    let p = i + 19;
+    if (p < s.len && s[p] == 46) {
+        p += 1;
+        while (p < s.len && isDigit(s[p])) { p += 1; }
+    }
+    if (p < s.len && (s[p] == 90 || s[p] == 122)) { p += 1; }
+    else if (p + 5 < s.len && (s[p] == 43 || s[p] == 45)) {
+        let q = p + 1;
+        if (digits(s, q, 2)) {
+            q += 2;
+            if (q < s.len && s[q] == 58) { q += 1; }
+            if (digits(s, q, 2)) { p = q + 2; }
+        }
+    }
+    return p - i;
+}
+
+fn digits(s: string, i: int, n: int): bool {
+    if (i + n > s.len) { return false; }
+    let k = 0;
+    while (k < n) {
+        if (!isDigit(s[i + k])) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+// a.b.c.d with 1-3 digits each. Matched before the number rule so an address
+// does not become "<N>.<N>.<N>.<N>".
+fn matchIpv4(s: string, i: int): int {
+    let p = i;
+    let part = 0;
+    while (part < 4) {
+        let ds = p;
+        while (p < s.len && isDigit(s[p]) && p - ds < 3) { p += 1; }
+        if (p == ds) { return 0; }
+        if (part < 3) {
+            if (p >= s.len || s[p] != 46) { return 0; }
+            p += 1;
+        }
+        part += 1;
+    }
+    // Must not run straight into more of a token.
+    if (p < s.len && (isHex(s[p]) || s[p] == 46)) { return 0; }
+    return p - i;
+}
+
+// A long hex run — a sha, a request id, a pointer. 8+ so ordinary short words
+// made of hex letters ("added", "face") are not swallowed.
+fn matchHexBlob(s: string, i: int): int {
+    let p = i;
+    let hasDigit = false;
+    let hasAlpha = false;
+    // An optional 0x prefix.
+    if (p + 1 < s.len && s[p] == 48 && (s[p + 1] == 120 || s[p + 1] == 88)) {
+        p += 2;
+    }
+    let start = p;
+    while (p < s.len && isHex(s[p])) {
+        if (isDigit(s[p])) { hasDigit = true; } else { hasAlpha = true; }
+        p += 1;
+    }
+    if (p - start < 8) { return 0; }
+    if (p < s.len && !isBoundary(s[p]) && s[p] != 46) { return 0; }
+    // Require both letters and digits, or it is just a long number (handled
+    // by matchNumber) or a plain word.
+    if (!hasDigit || !hasAlpha) { return 0; }
+    return p - i;
+}
+
+// An integer or decimal, with optional sign and unit-free.
+fn matchNumber(s: string, i: int): int {
+    let p = i;
+    if (p < s.len && (s[p] == 43 || s[p] == 45)) { p += 1; }
+    let ds = p;
+    while (p < s.len && isDigit(s[p])) { p += 1; }
+    if (p == ds) { return 0; }
+    if (p < s.len && s[p] == 46 && p + 1 < s.len && isDigit(s[p + 1])) {
+        p += 1;
+        while (p < s.len && isDigit(s[p])) { p += 1; }
+    }
+    // A number that runs into letters is part of an identifier ("v2", "utf8"),
+    // not a varying value — EXCEPT a trailing unit, which is common enough in
+    // logs ("43ms", "12KB") that keeping the unit outside the placeholder is
+    // what makes those lines collapse.
+    if (p < s.len && isLetter(s[p])) {
+        let u = p;
+        while (u < s.len && isLetter(s[u])) { u += 1; }
+        if (u - p > 2 || !isBoundary2(s, u)) { return 0; }
+    }
+    return p - i;
+}
+
+fn isLetter(c: int): bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+}
+
+fn isBoundary2(s: string, i: int): bool {
+    if (i >= s.len) { return true; }
+    return isBoundary(s[i]) || s[i] == 41 || s[i] == 93 || s[i] == 125 ||
+           s[i] == 59 || s[i] == 46;
+}
+
+// ---- the table -----------------------------------------------------------
+
+// Shape -> group, with a cap.
+//
+// A plain array scanned linearly would be O(n) per line and quadratic over a
+// file; this hashes the shape into buckets and only compares within one.
+export class Deduper {
+    groups: Group[];
+    buckets: int[][];     // hash bucket -> indices into groups
+    nbuckets: int;
+    cap: int;
+    dropped: int;         // lines whose shape was new after the cap was hit
+
+    fn init(cap: int) {
+        this.groups = [];
+        this.nbuckets = 4096;
+        this.buckets = [];
+        let i = 0;
+        while (i < this.nbuckets) {
+            let empty: int[] = [];
+            this.buckets.push(empty);
+            i += 1;
+        }
+        this.cap = cap;
+        this.dropped = 0;
+    }
+
+    fn hash(s: string): int {
+        // FNV-1a, 32-bit, masked into the bucket count.
+        let h = 2166136261;
+        let i = 0;
+        while (i < s.len) {
+            h = (h ^ s[i]) * 16777619;
+            h = h & 0x7fffffff;
+            i += 1;
+        }
+        return h % this.nbuckets;
+    }
+
+    fn add(rec: Record) {
+        let shape = shapeOf(rec.raw);
+        let b = this.hash(shape);
+        let bucket = this.buckets[b];
+
+        let i = 0;
+        while (i < bucket.len) {
+            let g = this.groups[bucket[i]];
+            i += 1;
+            if (g.shape != shape) { continue; }
+            g.count += 1;
+            if (rec.hasTime()) {
+                if (g.firstTs < 0 || rec.ts < g.firstTs) { g.firstTs = rec.ts; }
+                if (g.lastTs < 0 || rec.ts > g.lastTs)   { g.lastTs = rec.ts; }
+            }
+            return;
+        }
+
+        // New shape.
+        if (this.groups.len >= this.cap) {
+            // Refuse to grow. Counting these separately is what keeps the
+            // output honest: the footer says how many lines were not
+            // classified, so a truncated table never reads as a complete one.
+            this.dropped += 1;
+            return;
+        }
+
+        let g = new Group();
+        g.shape = shape;
+        g.sample = rec.raw;
+        g.origin = rec.origin;
+        g.count = 1;
+        g.firstTs = rec.ts;
+        g.lastTs = rec.ts;
+        g.firstLine = rec.lineNo;
+        this.groups.push(g);
+        this.buckets[b].push(this.groups.len - 1);
+    }
+
+    fn atCap(): bool { return this.groups.len >= this.cap; }
+}
+
+export fn deduper(cap: int): Deduper { return new Deduper(cap); }
+
+// Groups by descending count. The whole point is "what happened most", so
+// the order is the answer.
+export fn sortGroups(gs: Group[]) {
+    let i = 1;
+    while (i < gs.len) {
+        let v = gs[i];
+        let j = i - 1;
+        while (j >= 0 && gs[j].count < v.count) {
+            gs[j + 1] = gs[j];
+            j -= 1;
+        }
+        gs[j + 1] = v;
+        i += 1;
+    }
+}

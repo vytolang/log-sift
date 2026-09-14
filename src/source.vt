@@ -1,0 +1,98 @@
+// Getting lines out of files and stdin.
+//
+// Reading is deliberately `readlines()` rather than a manual pass over
+// `readfile()`. Measured on a 55 MB / 1M-line file, readlines costs about 43%
+// more peak RSS (157 MB vs 110 MB) and is marginally FASTER in wall time, so
+// the arena rewrite buys memory and nothing else. That trade is only worth
+// making when the file is large relative to available memory — which is why
+// --stream exists as an explicit choice rather than being the default.
+//
+// The one thing that IS required: a log file that does not exist must not
+// abort. `readfile` and `readlines` panic on a missing path or a directory,
+// so every read goes through a guard first.
+
+import { file_exists, file_size, file_mtime } from "vyto/io/file";
+import { unixSec } from "vyto/util/time";
+
+export class Source {
+    path: string;
+    label: string;       // what appears in --merge's prefix
+    mtime: i64;          // syslog's missing year comes from here
+    size: int;
+    ok: bool;
+    err: string;
+
+    fn init() {
+        this.path = "";
+        this.label = "";
+        this.mtime = 0;
+        this.size = 0;
+        this.ok = false;
+        this.err = "";
+    }
+}
+
+// Check a path before touching it.
+//
+// `isdir` is checked explicitly because `file_exists` is TRUE for a directory
+// and `readlines` on one aborts the process — the trap is easy to hit with a
+// glob that matched a folder.
+export fn open(path: string): Source {
+    let s = new Source();
+    s.path = path;
+    s.label = basename(path);
+
+    if (path == "-") {
+        s.label = "stdin";
+        s.ok = true;
+        s.mtime = unixSec();
+        return s;
+    }
+    if (!file_exists(path)) {
+        s.err = "no such file";
+        return s;
+    }
+    if (isdir(path)) {
+        s.err = "is a directory";
+        return s;
+    }
+    s.size = file_size(path);
+    s.mtime = file_mtime(path);
+    if (s.mtime <= 0) { s.mtime = unixSec(); }
+    s.ok = true;
+    return s;
+}
+
+export fn basename(p: string): string {
+    let i = p.last_index_of("/");
+    if (i < 0 || i + 1 >= p.len) { return p; }
+    return p.slice(i + 1, p.len);
+}
+
+// The lines of a source. Empty on any failure — callers report `err`.
+export fn lines(s: Source): string[] {
+    if (!s.ok) { return []; }
+    if (s.path == "-") { return readStdin(); }
+    return readlines(s.path);
+}
+
+// stdin, read whole. There is no line-at-a-time stdin builtin, so a piped
+// stream is buffered entirely — fine for the `cmd | log-sift` case, which is
+// bounded by whatever produced it.
+extern "C" {
+    fn ls_read_stdin(buf: cstring, cap: i32): i32;
+    fn ls_stdin_isatty(): i32;
+}
+
+fn readStdin(): string[] {
+    let cap = 1 << 24;                 // 16 MiB
+    let buf = bytes(cap);
+    let n = ls_read_stdin(buf as cstring, cap as i32) as int;
+    if (n <= 0) { return []; }
+    return str(buf as cstring).split("\n");
+}
+
+// Is stdin a terminal? Used to decide whether a bare `log-sift` with no file
+// should read stdin or print usage — waiting forever on a terminal is the
+// worst of the three options.
+export fn stdinIsTerminal(): bool { return (ls_stdin_isatty() as int) != 0; }
