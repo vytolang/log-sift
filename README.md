@@ -93,6 +93,36 @@ log-sift svc.json   --field request_id='*'      # key present, any value
 Works on JSON lines and logfmt. Nested objects are not addressable —
 `user.id` will not resolve.
 
+### Logs that are text wrapped around JSON
+
+Monolog, Laravel, Rails and Python's `logging` all write a human prefix
+followed by a JSON context blob:
+
+```
+[2026-05-20 12:04:53] dev.INFO: Receiving Mpesa callback from IP: ::1 {"transID":"ABC-007","transAmount":"1000","firstName":"John"}
+```
+
+Those lines are text *and* structured at once. `--field` reads into the
+payload, and `--extract` prints the payload alone:
+
+```sh
+log-sift laravel.log --field transID=ABC-007        # finds it
+log-sift laravel.log --field MSISDN='*' --extract   # just the JSON
+```
+
+```json
+{"transID":"ABC-007","transAmount":"1000","firstName":"John"}
+```
+
+which pipes straight into `jq`, `python -m json.tool`, or a database loader.
+
+The payload is the trailing object that **closes at the end of the line**, so
+braces in the prefix are not mistaken for it — a PHP `{closure}`, a
+`{placeholder}`, a brace in prose — and neither is a `}` inside a quoted
+value. Lines with no payload are skipped by `--extract` rather than printed
+raw, since one prose line in the middle breaks whatever consumes the stream;
+the number skipped is reported on **stderr**, so it never lands in the data.
+
 ### Merge
 
 ```sh
@@ -180,7 +210,7 @@ what you want for a log shipped from another machine.
 make test
 ```
 
-43 checks over fixtures the suite writes itself, so results never depend on
+55 checks over fixtures the suite writes itself, so results never depend on
 what is in `/var/log`. The dedupe cases assert in **both** directions —
 collapsing too little and collapsing too much are different bugs and a count
 alone cannot tell them apart. The shape-boundary rule and the merge ordering

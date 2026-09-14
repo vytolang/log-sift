@@ -46,3 +46,15 @@ int ls_stdin_isatty(void) {
  * stream piped into anything else emits nothing until the buffer fills, and
  * a follow is normally ended by a signal that discards it. */
 void ls_flush(void) { fflush(stdout); }
+
+/* Write a line to stderr.
+ *
+ * There is no `eprint` builtin -- `print` always goes to stdout.  Warnings
+ * have to avoid stdout entirely here: --extract exists to be piped into a
+ * JSON reader, and a diagnostic mixed into that stream corrupts the data
+ * rather than merely cluttering it. */
+void ls_eprint(const char *s) {
+    if (!s) return;
+    fputs(s, stderr);
+    fputc('\n', stderr);
+}

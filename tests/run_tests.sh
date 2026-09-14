@@ -156,6 +156,78 @@ eq "uuid collapses as one token" "1" \
 "$BIN" "$TMP/app.log" --dedupe --shapes 1 2>&1 | grep -q "shape limit" \
     && ok "shape cap is reported" || bad "shape cap is reported"
 
+# ---- 5b. embedded JSON payloads in text lines ---------------------------
+#
+# Monolog/Laravel/Rails/python-logging all write a human prefix followed by a
+# JSON context blob. Those lines sniff as TEXT, so without payload support a
+# --field query answers 0 — which a script reads as "no such record" rather
+# than "unsupported". That silent wrong answer is what these pin.
+
+cat > "$TMP/monolog.log" <<'MEOF'
+[2026-05-20 12:04:53] dev.INFO: callback from ::1 {"transID":"ABC-007","amount":"1000","name":"John"}
+[2026-05-20 12:04:57] dev.INFO: posting transaction {"id":16}
+[2026-05-20 12:04:58] dev.WARNING: App\Payment::post: failed, no invoice
+[2026-05-20 12:08:40] dev.INFO: callback from ::1 {"transID":"ABC-008","amount":"250","name":"Alice"}
+MEOF
+
+eq "field query reaches an embedded payload" "1" \
+    "$BIN" "$TMP/monolog.log" --field transID=ABC-007 --count
+eq "field wildcard selects payload-bearing lines" "2" \
+    "$BIN" "$TMP/monolog.log" --field transID='*' --count
+eq "--extract prints only the payload" \
+    '{"transID":"ABC-007","amount":"1000","name":"John"}' \
+    sh -c "'$BIN' '$TMP/monolog.log' --field transID=ABC-007 --extract 2>/dev/null"
+
+# --extract must emit ONLY JSON: a prose line in the middle breaks whatever
+# consumes the stream, so payload-less lines are skipped, not printed raw.
+eq "--extract skips lines with no payload" "3" \
+    sh -c "'$BIN' '$TMP/monolog.log' --extract 2>/dev/null | wc -l | tr -d ' '"
+
+# The skip count goes to stderr so it cannot land in a piped JSON stream.
+"$BIN" "$TMP/monolog.log" --extract 2>/dev/null | grep -q "no JSON payload" \
+    && bad "--extract warning stays off stdout" "warning contaminated the data stream" \
+    || ok "--extract warning stays off stdout"
+"$BIN" "$TMP/monolog.log" --extract 2>&1 >/dev/null | grep -q "no JSON payload" \
+    && ok "--extract reports skipped lines on stderr" \
+    || bad "--extract reports skipped lines on stderr"
+
+# Every extracted line must be parseable, which is the only assertion that
+# actually proves the boundary was found correctly.
+if command -v python3 >/dev/null 2>&1; then
+    if "$BIN" "$TMP/monolog.log" --extract 2>/dev/null | \
+       python3 -c 'import sys,json; [json.loads(l) for l in sys.stdin if l.strip()]' 2>/dev/null; then
+        ok "--extract output is valid JSON"
+    else
+        bad "--extract output is valid JSON"
+    fi
+fi
+
+# Braces in the human prefix must not be mistaken for the payload, and a
+# brace inside a quoted value must not close the object early. Scanning from
+# the right and requiring balance is what handles both.
+cat > "$TMP/braces.log" <<'BEOF'
+[2026-05-20 12:00:00] dev.ERROR: App\Foo::bar() {closure} failed {"code":500}
+[2026-05-20 12:00:01] dev.INFO: message with {braces} and no payload
+[2026-05-20 12:00:02] dev.INFO: nested {"outer":{"inner":42},"done":true}
+[2026-05-20 12:00:03] dev.INFO: quoted {"msg":"a } in a string","n":1}
+BEOF
+
+eq "a brace in the prefix is not the payload" '{"code":500}' \
+    sh -c "'$BIN' '$TMP/braces.log' --grep closure --extract 2>/dev/null"
+eq "an unbalanced brace run is not a payload" "0" \
+    "$BIN" "$TMP/braces.log" --grep 'and no payload' --field code='*' --count
+eq "a nested object extracts whole" '{"outer":{"inner":42},"done":true}' \
+    sh -c "'$BIN' '$TMP/braces.log' --grep nested --extract 2>/dev/null"
+eq "a brace inside a string does not close the object" \
+    '{"msg":"a } in a string","n":1}' \
+    sh -c "'$BIN' '$TMP/braces.log' --grep quoted --extract 2>/dev/null"
+
+# A whole-line JSON record is the record itself, not an embedded payload, so
+# --extract must not alter it.
+eq "--extract is a no-op on pure JSON lines" \
+    '{"time":"2026-09-14T10:00:03Z","level":"info","msg":"cache warm","user_id":42}' \
+    sh -c "'$BIN' '$TMP/svc.json' --field user_id=42 --head 1 --extract 2>/dev/null"
+
 # ---- 6. merge orders by time across formats -----------------------------
 
 merged=$("$BIN" "$TMP/app.log" "$TMP/svc.json" "$TMP/svc.logfmt" --merge)

@@ -23,7 +23,14 @@ import { date_from_unix_local, date_format } from "vyto/util/date";
 
 export const VERSION: string = "0.1.0";
 
-extern "C" { fn ls_flush(); }
+extern "C" {
+    fn ls_flush();
+    fn ls_eprint(s: cstring);
+}
+
+// Warnings go to stderr, never stdout: --extract is meant to be piped into a
+// JSON reader, and a diagnostic in that stream corrupts the data.
+fn eprint(s: string) { ls_eprint(s.cstr()); }
 
 fn main() {
     let app = new Cli("log-sift", "one query interface over any log format");
@@ -41,6 +48,7 @@ fn main() {
     app.intOption("shapes", "maximum distinct shapes to track when deduping")
        .dfltInt(DEFAULT_CAP).meta("N");
     app.flag("merge", "interleave several files by timestamp").short("m");
+    app.flag("extract", "print only the embedded JSON payload of each line").short("x");
     app.flag("count", "print only the number of matching lines").short("c");
     app.flag("utc", "read zone-less timestamps as UTC, not local time");
     app.flag("stats", "summarise what was read instead of printing lines");
@@ -129,16 +137,35 @@ fn main() {
     }
 
     let showPrefix = srcs.len > 1 && !app.on("no-prefix");
+    let extract = app.on("extract");
     let limit = app.getInt("head");
     let shown = 0;
+    let noPayload = 0;
     i = 0;
     while (i < recs.len) {
         let r = recs[i];
         i += 1;
-        if (showPrefix) { print(`{r.origin}: {r.raw}`); }
-        else            { print(r.raw); }
+
+        let text = r.raw;
+        if (extract) {
+            // A line with no payload is SKIPPED, not printed whole: the
+            // output of --extract is meant to be fed to a JSON reader, and
+            // one prose line in the middle of it breaks the consumer. How
+            // many were skipped is reported at the end so the count is never
+            // silently short.
+            if (!r.hasPayload()) { noPayload += 1; continue; }
+            text = r.payloadText();
+        }
+
+        if (showPrefix) { print(`{r.origin}: {text}`); }
+        else            { print(text); }
         shown += 1;
         if (limit > 0 && shown >= limit) { break; }
+    }
+
+    if (extract && noPayload > 0) {
+        // To stderr, so it does not land in a file being piped to jq.
+        eprint(`log-sift: {noPayload} matching lines had no JSON payload`);
     }
     exit(exitFor(recs.len, bad));
 }

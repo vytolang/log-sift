@@ -67,6 +67,22 @@ export class Record {
     origin: string;       // filename, for --merge's prefix
     lineNo: int;
 
+    // Where an embedded JSON object starts inside `raw`, or -1.
+    //
+    // A line is very often text AND structured at once: every Monolog,
+    // Laravel, Rails and Python-logging line is a human prefix followed by a
+    // JSON context blob.
+    //
+    //   [2026-05-20 12:04:53] dev.INFO: callback from ::1 {"transID":"X",...}
+    //   ^--------------- text ---------------------------^^--- payload ---^
+    //
+    // Treating format as one per-file choice makes those lines pure text, so
+    // a --field query silently answers zero — which reads as "no such
+    // transaction" rather than "this tool cannot see in there". Recording the
+    // offset is what lets a field query and --extract reach the payload
+    // without reclassifying the line.
+    payload: int;
+
     fn init() {
         this.raw = "";
         this.ts = NO_TIME;
@@ -74,9 +90,17 @@ export class Record {
         this.source = F_TEXT;
         this.origin = "";
         this.lineNo = 0;
+        this.payload = -1;
     }
 
     fn hasTime(): bool { return this.ts != NO_TIME; }
+    fn hasPayload(): bool { return this.payload >= 0; }
+
+    // The embedded object alone, or "" when there is none.
+    fn payloadText(): string {
+        if (this.payload < 0) { return ""; }
+        return this.raw.slice(this.payload, this.raw.len).trim();
+    }
 }
 
 // ---- format sniffing ----------------------------------------------------
@@ -136,6 +160,70 @@ export fn sniff(lines: string[], sample: int): int {
     return F_TEXT;
 }
 
+// ---- embedded payloads --------------------------------------------------
+
+// Where a trailing JSON object begins in `line`, or -1.
+//
+// The rule that does the work is `balanced()`: the candidate must open an
+// object that closes exactly at end-of-line. That alone rejects a brace
+// mentioned mid-sentence, a PHP `{closure}` in the prefix, and any earlier
+// object that has already closed — and it means AT MOST ONE offset in a line
+// can qualify, so the answer does not depend on which end the scan starts
+// from. (Checked by running the suite with this loop reversed: identical
+// output. An earlier version of this comment claimed the direction was
+// load-bearing for correctness. It is not.)
+//
+// Scanning from the right is therefore a cost choice: the payload sits at the
+// end, so the first candidate tested is normally the answer and a long prefix
+// full of braces is never walked.
+//
+// Quoted strings are tracked so a '{' or '}' inside a value does not affect
+// the depth, and a backslash escape inside a string is skipped.
+export fn findPayload(line: string): int {
+    // Ignore trailing whitespace: these lines usually end with one.
+    let end = line.len;
+    while (end > 0 && (line[end - 1] == 32 || line[end - 1] == 9 ||
+                       line[end - 1] == 13)) { end -= 1; }
+    if (end < 2 || line[end - 1] != 125) { return -1; }     // must end in '}'
+
+    // Walk backwards to the matching '{'. Depth counting has to run forwards
+    // to know what is inside a string, so instead find every candidate '{'
+    // from the right and test the first one that balances.
+    let i = end - 1;
+    while (i >= 0) {
+        if (line[i] == 123) {                                // '{'
+            if (balanced(line, i, end)) { return i; }
+        }
+        i -= 1;
+    }
+    return -1;
+}
+
+// Does the object starting at `start` close exactly at `end`?
+fn balanced(s: string, start: int, end: int): bool {
+    let depth = 0;
+    let inStr = false;
+    let i = start;
+    while (i < end) {
+        let c = s[i];
+        if (inStr) {
+            if (c == 92) { i += 2; continue; }               // escape
+            if (c == 34) { inStr = false; }
+            i += 1;
+            continue;
+        }
+        if (c == 34)      { inStr = true; }
+        else if (c == 123) { depth += 1; }
+        else if (c == 125) {
+            depth -= 1;
+            if (depth == 0) { return i == end - 1; }
+            if (depth < 0)  { return false; }
+        }
+        i += 1;
+    }
+    return false;
+}
+
 // ---- field extraction ---------------------------------------------------
 
 // Find the value of `key` in this line, or "" if absent.
@@ -146,7 +234,16 @@ export fn sniff(lines: string[], sample: int): int {
 // allocating tens of millions of strings.
 export fn fieldOf(rec: Record, key: string): string {
     if (rec.source == F_JSON)   { return jsonField(rec.raw, key); }
-    if (rec.source == F_LOGFMT) { return logfmtField(rec.raw, key); }
+    if (rec.source == F_LOGFMT) {
+        let v = logfmtField(rec.raw, key);
+        if (!v.is_empty()) { return v; }
+        // A logfmt line can still carry a JSON blob as one of its values.
+    }
+    // A text line with a trailing JSON payload is queried inside that
+    // payload. Without this a --field on a Monolog-style log answers zero for
+    // every key, which a script reads as "no such record" rather than "not
+    // supported" — the failure is silent and points the wrong way.
+    if (rec.hasPayload()) { return jsonField(rec.payloadText(), key); }
     return "";
 }
 
@@ -301,6 +398,17 @@ export fn makeRecord(raw: string, source: int, origin: string, lineNo: int,
     r.origin = origin;
     r.lineNo = lineNo;
     r.level = detectLevel(raw, source);
+
+    // Where the structured part of this line begins.
+    //
+    // For a whole-line JSON record that is the line itself, so the offset is
+    // its opening brace rather than -1: --extract has to be a no-op on a pure
+    // JSON log, and treating those lines as payload-less made it silently
+    // emit nothing for every one of them.
+    //
+    // For anything else it is a trailing payload, if the line carries one.
+    if (source == F_JSON) { r.payload = raw.index_of("{"); }
+    else                  { r.payload = findPayload(raw); }
 
     if (source == F_JSON) {
         // A JSON log's time is a field, not a prefix, so the positional
