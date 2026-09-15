@@ -37,8 +37,8 @@ Measured on a 500,000-line, 28 MB log with five underlying event types:
 
 | | time | peak RSS | answer |
 |---|---|---|---|
-| `log-sift --dedupe` | 1.9 s | 104 MB | the 5 real shapes, 100,000 each |
-| `sort \| uniq -c \| sort -rn` | 2.5 s | 77 MB | top hit "10" — useless |
+| `log-sift --dedupe` | 1.2 s | 104 MB | the 5 real shapes, 100,000 each |
+| `sort \| uniq -c \| sort -rn` | 2.0 s | 78 MB | top hit "10" — useless |
 
 The exact-match pipeline is slower *and* cannot see past the timestamp.
 
@@ -176,9 +176,10 @@ fi
 ## What it is not
 
 **It is not a faster grep.** Measured on the same 500,000-line file, `grep -c
-ERROR` takes 0.01 s against log-sift's 0.83 s — roughly 80× — because grep
-runs Boyer-Moore over a mapped file while log-sift parses a timestamp and
-determines a level on every line. If a substring is all you need, use grep.
+ERROR` takes 0.01 s against log-sift's 0.65 s — roughly 65× — because grep
+runs Boyer-Moore over a mapped file while log-sift parses a timestamp,
+determines a level and locates any JSON payload on every line. If a substring
+is all you need, use grep.
 
 Reach for this when you want shape collapsing, cross-format merging, or a
 field query — the things grep structurally cannot do.
@@ -213,8 +214,20 @@ make test
 55 checks over fixtures the suite writes itself, so results never depend on
 what is in `/var/log`. The dedupe cases assert in **both** directions —
 collapsing too little and collapsing too much are different bugs and a count
-alone cannot tell them apart. The shape-boundary rule and the merge ordering
-were each fault-injected to confirm the suite fails when they break.
+alone cannot tell them apart.
+
+The shape-boundary rule, the merge ordering and the payload scanner were each
+fault-injected to confirm the suite fails when they break. Two of those found
+a weak test rather than a weak implementation:
+
+- The first merge assertion passed with sorting **disabled entirely**, because
+  it only checked the first line. It now compares the whole timestamp sequence
+  against its own sort.
+- The payload scanner's direction turned out not to matter. Requiring the
+  object to close at end-of-line means at most one offset per line can
+  qualify, so scanning from either end gives the same answer — verified by
+  running the suite with the loop reversed. The comment that claimed otherwise
+  was corrected rather than left standing.
 
 ## Licence
 
